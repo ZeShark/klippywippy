@@ -1,85 +1,105 @@
 const express = require('express');
-const AWS = require('aws-sdk');
 const fetch = require('node-fetch');
+const AWS = require('aws-sdk');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 3000;
 
-// Twitch API credentials
-const CLIENT_ID = process.env.TWITCH_CLIENT_ID;
-const CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
-const BROADCASTER_USERNAME = process.env.TWITCH_USERNAME;
+// 🌐 Cloudflare R2 credentials from Railway Environment Variables
+const CF_ACCESS_KEY_ID = process.env.CF_ACCESS_KEY_ID;
+const CF_SECRET_ACCESS_KEY = process.env.CF_SECRET_ACCESS_KEY;
+const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
+const CF_BUCKET_NAME = process.env.CF_BUCKET_NAME;
+const CF_R2_REGION = 'auto';
 
-// Cloudflare R2 config
-const r2 = new AWS.S3({
-  endpoint: `https://${process.env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  accessKeyId: process.env.CF_ACCESS_KEY_ID,
-  secretAccessKey: process.env.CF_SECRET_ACCESS_KEY,
+// 🎮 Twitch credentials from Railway Environment Variables
+const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
+const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
+const TWITCH_USERNAME = process.env.TWITCH_USERNAME;
+
+// ✅ Setup AWS S3 for R2
+const s3 = new AWS.S3({
+  endpoint: `https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  accessKeyId: CF_ACCESS_KEY_ID,
+  secretAccessKey: CF_SECRET_ACCESS_KEY,
+  region: CF_R2_REGION,
   signatureVersion: 'v4',
-  region: 'auto',
 });
 
-// Upload file to R2
-async function uploadToR2(fileName, fileBuffer, contentType) {
-  return r2
-    .putObject({
-      Bucket: process.env.CF_BUCKET_NAME,
+app.get('/', async (req, res) => {
+  try {
+    console.log('🔑 Getting Twitch access token...');
+    const token = await getTwitchAccessToken();
+
+    console.log('👤 Getting broadcaster ID...');
+    const broadcasterId = await getBroadcasterId(token);
+
+    console.log('🎥 Fetching clips...');
+    const clips = await getTwitchClips(token, broadcasterId);
+
+    console.log(`🎬 Found ${clips.length} clips`);
+
+    if (!clips.length) {
+      console.log('🚫 No clips found.');
+      return res.send('No clips found');
+    }
+
+    const clip = clips[Math.floor(Math.random() * clips.length)];
+    const videoUrl = clip.thumbnail_url.replace('-preview-480x272.jpg', '.mp4');
+    console.log('🎬 Clip URL:', videoUrl);
+
+    const videoResponse = await fetch(videoUrl);
+    if (!videoResponse.ok) {
+      console.error(`❌ Failed to download video: ${videoResponse.status}`);
+      return res.status(500).send('Failed to download video');
+    }
+
+    console.log('✅ Clip downloaded');
+    const videoData = await videoResponse.buffer();
+    const fileName = `${clip.id}.mp4`;
+
+    console.log(`💾 Uploading ${fileName} to R2 bucket: ${CF_BUCKET_NAME}`);
+    await s3.putObject({
+      Bucket: CF_BUCKET_NAME,
       Key: fileName,
-      Body: fileBuffer,
-      ContentType: contentType,
-    })
-    .promise();
-}
+      Body: videoData,
+      ContentType: 'video/mp4',
+    }).promise();
 
-// List objects in R2 bucket
-async function listR2Objects() {
-  const result = await r2
-    .listObjectsV2({
-      Bucket: process.env.CF_BUCKET_NAME,
-    })
-    .promise();
-  return result.Contents || [];
-}
+    console.log(`✅ Clip uploaded as ${fileName}`);
+    res.send(`✅ Clip uploaded as ${fileName}`);
 
-// Delete object from R2
-async function deleteFromR2(key) {
-  await r2
-    .deleteObject({
-      Bucket: process.env.CF_BUCKET_NAME,
-      Key: key,
-    })
-    .promise();
-}
+  } catch (error) {
+    console.error('❌ Error:', error);
+    res.status(500).send(error.toString());
+  }
+});
 
-// Get Twitch Access Token
 async function getTwitchAccessToken() {
-  const url = `https://id.twitch.tv/oauth2/token?client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&grant_type=client_credentials`;
-  const response = await fetch(url, { method: 'POST' });
+  const response = await fetch(`https://id.twitch.tv/oauth2/token?client_id=${TWITCH_CLIENT_ID}&client_secret=${TWITCH_CLIENT_SECRET}&grant_type=client_credentials`, {
+    method: 'POST',
+  });
   const data = await response.json();
   if (!response.ok) throw new Error(`Failed to get token: ${data.message}`);
   return data.access_token;
 }
 
-// Get Broadcaster ID
 async function getBroadcasterId(token) {
-  const url = `https://api.twitch.tv/helix/users?login=${BROADCASTER_USERNAME}`;
-  const response = await fetch(url, {
+  const response = await fetch(`https://api.twitch.tv/helix/users?login=${TWITCH_USERNAME}`, {
     headers: {
-      'Client-ID': CLIENT_ID,
+      'Client-ID': TWITCH_CLIENT_ID,
       Authorization: `Bearer ${token}`,
     },
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(`Failed to get user: ${data.message}`);
+  if (!response.ok || !data.data.length) throw new Error(`Failed to get user: ${data.message}`);
   return data.data[0].id;
 }
 
-// Get Clips
 async function getTwitchClips(token, broadcasterId) {
-  const url = `https://api.twitch.tv/helix/clips?broadcaster_id=${broadcasterId}&first=100`;
-  const response = await fetch(url, {
+  const response = await fetch(`https://api.twitch.tv/helix/clips?broadcaster_id=${broadcasterId}&first=100`, {
     headers: {
-      'Client-ID': CLIENT_ID,
+      'Client-ID': TWITCH_CLIENT_ID,
       Authorization: `Bearer ${token}`,
     },
   });
@@ -88,48 +108,6 @@ async function getTwitchClips(token, broadcasterId) {
   return data.data;
 }
 
-// Download and upload random clip
-async function downloadAndUploadRandomClip() {
-  const token = await getTwitchAccessToken();
-  const broadcasterId = await getBroadcasterId(token);
-  const clips = await getTwitchClips(token, broadcasterId);
-
-  if (!clips.length) throw new Error('No clips found.');
-
-  const clip = clips[Math.floor(Math.random() * clips.length)];
-  const videoUrl = clip.thumbnail_url.replace('-preview-480x272.jpg', '.mp4');
-  const fileName = `${clip.id}.mp4`;
-
-  const videoResponse = await fetch(videoUrl);
-  if (!videoResponse.ok) throw new Error(`Failed to download video: ${videoResponse.status}`);
-
-  const videoBuffer = await videoResponse.buffer();
-  await uploadToR2(fileName, videoBuffer, 'video/mp4');
-  console.log(`✅ Uploaded clip: ${fileName}`);
-
-  // Auto delete if more than 50 clips
-  const objects = await listR2Objects();
-  if (objects.length > 50) {
-    const oldest = objects.sort((a, b) => a.LastModified - b.LastModified)[0];
-    await deleteFromR2(oldest.Key);
-    console.log(`🗑️ Deleted oldest clip: ${oldest.Key}`);
-  }
-}
-
-app.get('/fetch-clip', async (req, res) => {
-  try {
-    await downloadAndUploadRandomClip();
-    res.send('✅ Clip fetched and uploaded to R2!');
-  } catch (err) {
-    console.error('❌ Error:', err);
-    res.status(500).send(`❌ Failed: ${err.message}`);
-  }
-});
-
-app.get('/', (req, res) => {
-  res.send('🚀 Twitch Clip Downloader with Cloudflare R2!');
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+app.listen(port, () => {
+  console.log(`🚀 Server running on port ${port}`);
 });
