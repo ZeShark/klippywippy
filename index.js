@@ -1,67 +1,106 @@
 require('dotenv').config();
-const axios = require('axios');
+const fetch = require('node-fetch');
+const AWS = require('aws-sdk');
 
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
-const BROADCASTER = process.env.BROADCASTER;
+// Setup R2 (S3-compatible)
+const r2 = new AWS.S3({
+  endpoint: process.env.CF_R2_ENDPOINT,
+  accessKeyId: process.env.CF_ACCESS_KEY_ID,
+  secretAccessKey: process.env.CF_SECRET_ACCESS_KEY,
+  signatureVersion: 'v4',
+  region: 'auto'
+});
 
 async function getTwitchAccessToken() {
-  const response = await axios.post(`https://id.twitch.tv/oauth2/token`, null, {
-    params: {
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      grant_type: 'client_credentials'
-    }
-  });
-  return response.data.access_token;
+  const url = `https://id.twitch.tv/oauth2/token?client_id=${process.env.TWITCH_CLIENT_ID}&client_secret=${process.env.TWITCH_CLIENT_SECRET}&grant_type=client_credentials`;
+  const res = await fetch(url, { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Failed to get token: ${data.message}`);
+  return data.access_token;
 }
 
 async function getBroadcasterId(token) {
-  const response = await axios.get(`https://api.twitch.tv/helix/users`, {
+  const url = `https://api.twitch.tv/helix/users?login=${process.env.TWITCH_BROADCASTER_USERNAME}`;
+  const res = await fetch(url, {
     headers: {
-      'Client-ID': CLIENT_ID,
-      'Authorization': `Bearer ${token}`
-    },
-    params: {
-      login: BROADCASTER
+      'Client-ID': process.env.TWITCH_CLIENT_ID,
+      Authorization: `Bearer ${token}`
     }
   });
-  return response.data.data[0].id;
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Failed to get user: ${data.message}`);
+  return data.data[0].id;
 }
 
 async function getTwitchClips(token, broadcasterId) {
-  const response = await axios.get(`https://api.twitch.tv/helix/clips`, {
+  const url = `https://api.twitch.tv/helix/clips?broadcaster_id=${broadcasterId}&first=100`;
+  const res = await fetch(url, {
     headers: {
-      'Client-ID': CLIENT_ID,
-      'Authorization': `Bearer ${token}`
-    },
-    params: {
-      broadcaster_id: broadcasterId,
-      first: 5
+      'Client-ID': process.env.TWITCH_CLIENT_ID,
+      Authorization: `Bearer ${token}`
     }
   });
-  return response.data.data;
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Failed to get clips: ${data.message}`);
+  return data.data;
 }
 
-async function main() {
-  try {
-    console.log('🔑 Getting Twitch access token...');
-    const token = await getTwitchAccessToken();
+async function uploadToR2(filename, data) {
+  return r2
+    .putObject({
+      Bucket: process.env.CF_BUCKET_NAME,
+      Key: filename,
+      Body: data,
+      ContentType: 'video/mp4'
+    })
+    .promise();
+}
 
-    console.log('👤 Getting broadcaster ID...');
-    const broadcasterId = await getBroadcasterId(token);
+async function deleteOldestIfNeeded() {
+  const listedObjects = await r2
+    .listObjectsV2({
+      Bucket: process.env.CF_BUCKET_NAME
+    })
+    .promise();
 
-    console.log('🎥 Fetching clips...');
-    const clips = await getTwitchClips(token, broadcasterId);
-    console.log(`🎬 Found ${clips.length} clips`);
-
-    clips.forEach((clip) => {
-      console.log(`📹 ${clip.title}: ${clip.url}`);
-    });
-
-  } catch (err) {
-    console.error('❌ Error:', err.response ? err.response.data : err.message);
+  if (listedObjects.Contents.length >= 50) {
+    const oldest = listedObjects.Contents.sort((a, b) => a.LastModified - b.LastModified)[0];
+    await r2
+      .deleteObject({
+        Bucket: process.env.CF_BUCKET_NAME,
+        Key: oldest.Key
+      })
+      .promise();
+    console.log(`🗑️ Deleted oldest clip: ${oldest.Key}`);
   }
 }
 
-main();
+async function downloadAndUploadRandomClip() {
+  const token = await getTwitchAccessToken();
+  const broadcasterId = await getBroadcasterId(token);
+  const clips = await getTwitchClips(token, broadcasterId);
+
+  if (!clips.length) {
+    console.log('🚫 No clips found.');
+    return;
+  }
+
+  await deleteOldestIfNeeded();
+
+  const clip = clips[Math.floor(Math.random() * clips.length)];
+  const videoUrl = clip.thumbnail_url.replace('-preview-480x272.jpg', '.mp4');
+  console.log(`⬇️ Downloading clip: ${clip.title} from ${videoUrl}`);
+
+  const videoRes = await fetch(videoUrl);
+  if (!videoRes.ok) throw new Error(`Failed to download video: ${videoRes.status}`);
+
+  const videoBuffer = await videoRes.buffer();
+  const filename = `${clip.id}.mp4`;
+
+  await uploadToR2(filename, videoBuffer);
+  console.log(`✅ Uploaded ${filename} to R2.`);
+}
+
+downloadAndUploadRandomClip().catch(err => {
+  console.error('❌ Error:', err);
+});
