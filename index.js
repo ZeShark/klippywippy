@@ -1,6 +1,6 @@
-import express from 'express';
-import AWS from 'aws-sdk';
-import fetch from 'node-fetch';
+const express = require('express');
+const AWS = require('aws-sdk');
+const fetch = require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
