@@ -1,82 +1,75 @@
 const express = require('express');
 const fetch = require('node-fetch');
-const AWS = require('aws-sdk');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { fromStatic } = require('@aws-sdk/credential-providers');
 
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-// 🌐 Cloudflare R2 credentials from Railway Environment Variables
-const CF_ACCESS_KEY_ID = process.env.CF_ACCESS_KEY_ID;
-const CF_SECRET_ACCESS_KEY = process.env.CF_SECRET_ACCESS_KEY;
-const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
-const CF_BUCKET_NAME = process.env.CF_BUCKET_NAME;
-const CF_R2_REGION = 'auto';
+const clientId = process.env.TWITCH_CLIENT_ID;
+const clientSecret = process.env.TWITCH_CLIENT_SECRET;
+const twitchUsername = process.env.TWITCH_USERNAME;
 
-// 🎮 Twitch credentials from Railway Environment Variables
-const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
-const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
-const TWITCH_USERNAME = process.env.TWITCH_USERNAME;
-
-// ✅ Setup AWS S3 for R2
-const s3 = new AWS.S3({
-  endpoint: `https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  accessKeyId: CF_ACCESS_KEY_ID,
-  secretAccessKey: CF_SECRET_ACCESS_KEY,
-  region: CF_R2_REGION,
-  signatureVersion: 'v4',
+// Setup Cloudflare R2 client (AWS SDK v3)
+const s3 = new S3Client({
+  region: 'auto',
+  endpoint: `https://${process.env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: fromStatic({
+    accessKeyId: process.env.CF_ACCESS_KEY_ID,
+    secretAccessKey: process.env.CF_SECRET_ACCESS_KEY,
+  }),
 });
 
+// Main route
 app.get('/', async (req, res) => {
   try {
-    console.log('🔑 Getting Twitch access token...');
-    const token = await getTwitchAccessToken();
+    console.log("🔑 Getting Twitch access token...");
+    const token = await getTwitchAccessToken(clientId, clientSecret);
 
-    console.log('👤 Getting broadcaster ID...');
-    const broadcasterId = await getBroadcasterId(token);
+    console.log("👤 Getting broadcaster ID...");
+    const broadcasterId = await getBroadcasterId(clientId, token, twitchUsername);
 
-    console.log('🎥 Fetching clips...');
-    const clips = await getTwitchClips(token, broadcasterId);
-
+    console.log("🎥 Fetching clips...");
+    const clips = await getTwitchClips(clientId, token, broadcasterId);
     console.log(`🎬 Found ${clips.length} clips`);
 
     if (!clips.length) {
-      console.log('🚫 No clips found.');
-      return res.send('No clips found');
+      console.log("🚫 No clips found.");
+      return res.send('No clips found.');
     }
 
     const clip = clips[Math.floor(Math.random() * clips.length)];
     const videoUrl = clip.thumbnail_url.replace('-preview-480x272.jpg', '.mp4');
-    console.log('🎬 Clip URL:', videoUrl);
-
-    const videoResponse = await fetch(videoUrl);
-    if (!videoResponse.ok) {
-      console.error(`❌ Failed to download video: ${videoResponse.status}`);
-      return res.status(500).send('Failed to download video');
-    }
-
-    console.log('✅ Clip downloaded');
-    const videoData = await videoResponse.buffer();
     const fileName = `${clip.id}.mp4`;
 
-    console.log(`💾 Uploading ${fileName} to R2 bucket: ${CF_BUCKET_NAME}`);
-    await s3.putObject({
-      Bucket: CF_BUCKET_NAME,
+    console.log(`⬇️ Downloading clip: ${clip.title} from ${videoUrl}`);
+    const videoResponse = await fetch(videoUrl);
+
+    if (!videoResponse.ok) {
+      throw new Error(`Failed to download video: ${videoResponse.status}`);
+    }
+
+    const videoData = await videoResponse.arrayBuffer();
+
+    console.log(`💾 Uploading ${fileName} to R2...`);
+    await s3.send(new PutObjectCommand({
+      Bucket: process.env.CF_BUCKET_NAME,
       Key: fileName,
-      Body: videoData,
+      Body: Buffer.from(videoData),
       ContentType: 'video/mp4',
-    }).promise();
+    }));
 
-    console.log(`✅ Clip uploaded as ${fileName}`);
-    res.send(`✅ Clip uploaded as ${fileName}`);
-
-  } catch (error) {
-    console.error('❌ Error:', error);
-    res.status(500).send(error.toString());
+    console.log(`✅ Upload complete!`);
+    res.send(`✅ Uploaded clip: ${fileName}`);
+  } catch (err) {
+    console.error(`❌ Error: ${err}`);
+    res.status(500).send(`Error: ${err.message}`);
   }
 });
 
-async function getTwitchAccessToken() {
-  const response = await fetch(`https://id.twitch.tv/oauth2/token?client_id=${TWITCH_CLIENT_ID}&client_secret=${TWITCH_CLIENT_SECRET}&grant_type=client_credentials`, {
+// Twitch Access Token
+async function getTwitchAccessToken(clientId, clientSecret) {
+  const response = await fetch(`https://id.twitch.tv/oauth2/token?client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`, {
     method: 'POST',
   });
   const data = await response.json();
@@ -84,22 +77,24 @@ async function getTwitchAccessToken() {
   return data.access_token;
 }
 
-async function getBroadcasterId(token) {
-  const response = await fetch(`https://api.twitch.tv/helix/users?login=${TWITCH_USERNAME}`, {
+// Twitch User ID
+async function getBroadcasterId(clientId, token, username) {
+  const response = await fetch(`https://api.twitch.tv/helix/users?login=${username}`, {
     headers: {
-      'Client-ID': TWITCH_CLIENT_ID,
+      'Client-ID': clientId,
       Authorization: `Bearer ${token}`,
     },
   });
   const data = await response.json();
-  if (!response.ok || !data.data.length) throw new Error(`Failed to get user: ${data.message}`);
+  if (!response.ok) throw new Error(`Failed to get user: ${data.message}`);
   return data.data[0].id;
 }
 
-async function getTwitchClips(token, broadcasterId) {
+// Twitch Clips
+async function getTwitchClips(clientId, token, broadcasterId) {
   const response = await fetch(`https://api.twitch.tv/helix/clips?broadcaster_id=${broadcasterId}&first=100`, {
     headers: {
-      'Client-ID': TWITCH_CLIENT_ID,
+      'Client-ID': clientId,
       Authorization: `Bearer ${token}`,
     },
   });
@@ -108,6 +103,6 @@ async function getTwitchClips(token, broadcasterId) {
   return data.data;
 }
 
-app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
