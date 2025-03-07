@@ -1,7 +1,6 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { fromStatic } = require('@aws-sdk/credential-providers');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,14 +10,15 @@ const clientSecret = process.env.TWITCH_CLIENT_SECRET;
 const twitchUsername = process.env.TWITCH_USERNAME;
 
 // Setup Cloudflare R2 client (AWS SDK v3)
-const s3 = new S3Client({
-  region: 'auto',
-  endpoint: `https://${process.env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: fromStatic({
-    accessKeyId: process.env.CF_ACCESS_KEY_ID,
-    secretAccessKey: process.env.CF_SECRET_ACCESS_KEY,
-  }),
-});
+const s3Client = new S3Client({
+    region: process.env.CF_R2_REGION,
+    endpoint: process.env.CF_R2_ENDPOINT,
+    credentials: {
+      accessKeyId: process.env.CF_ACCESS_KEY_ID,
+      secretAccessKey: process.env.CF_SECRET_ACCESS_KEY,
+    },
+  });
+  
 
 // Main route
 app.get('/', async (req, res) => {
