@@ -19,18 +19,23 @@ async function getTwitchAccessToken() {
   return data.access_token;
 }
 
-async function getBroadcasterId(token) {
-  const url = `https://api.twitch.tv/helix/users?login=${process.env.TWITCH_BROADCASTER_USERNAME}`;
-  const res = await fetch(url, {
-    headers: {
-      'Client-ID': process.env.TWITCH_CLIENT_ID,
-      Authorization: `Bearer ${token}`
+async function getBroadcasterId(clientId, token, username) {
+    const response = await fetch(`https://api.twitch.tv/helix/users?login=${username}`, {
+      headers: {
+        "Client-ID": clientId,
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    const data = await response.json();
+  
+    if (!response.ok) throw new Error(`Failed to get user: ${data.message}`);
+  
+    if (!data.data || data.data.length === 0) {
+      throw new Error(`No user found with username: ${username}`);
     }
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(`Failed to get user: ${data.message}`);
-  return data.data[0].id;
-}
+  
+    return data.data[0].id;
+  }
 
 async function getTwitchClips(token, broadcasterId) {
   const url = `https://api.twitch.tv/helix/clips?broadcaster_id=${broadcasterId}&first=100`;
